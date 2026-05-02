@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ArgusCam.Api/ArgusCam.Api.csproj" />
+    <Project Path="src/ArgusCam.Application/ArgusCam.Application.csproj" />
+    <Project Path="src/ArgusCam.Domain/ArgusCam.Domain.csproj" />
+    <Project Path="src/ArgusCam.Infrastructure/ArgusCam.Infrastructure.csproj" />
+  </Folder>
+</Solution>

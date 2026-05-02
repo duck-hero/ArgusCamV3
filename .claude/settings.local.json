@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs grep *)",
+      "Bash(ls \"C:/Users/kesat/Desktop/SVIDEO/svideo-console/OrderPackagingVideoConsole/\"*.dll)",
+      "WebFetch(domain:jsr.io)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.npmjs.com)",
+      "WebFetch(domain:community.cloudflare.com)"
+    ]
+  }
+}

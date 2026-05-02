@@ -1,0 +1,78 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleasePublic/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+artifacts/
+build/
+bld/
+out/
+
+# Visual Studio / JetBrains / VS Code
+.vs/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# Test and coverage
+TestResults/
+*.trx
+coverage/
+*.coverage
+*.coveragexml
+
+# Logs
+*.log
+logs/
+
+# Frontend (Node/Vite)
+node_modules/
+.npm-cache/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local-only Scanner Station scratch/public assets
+svideo-station/ArgusCam.ScannerStation/public/
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+!packages/build/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
+appsettings.local.json
+appsettings.Development.json
+
+# Large local binaries
+src/ArgusCam.Api/tools/ffmpeg/ffmpeg.exe
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+
+# HikVision DLLs local copy (auto-generated khi build scanner station)
+svideo-station/ArgusCam.ScannerStation/HikVision/
