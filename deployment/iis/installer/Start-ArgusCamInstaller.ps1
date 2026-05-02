@@ -7,12 +7,25 @@ function Test-Administrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
 }
 
+function Wait-ForKey {
+    Write-Host ""
+    Write-Host "Press any key to close this window..." -ForegroundColor Cyan
+    try {
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
+    catch {
+        Read-Host "Press Enter to continue" | Out-Null
+    }
+}
+
 $scriptPath = $MyInvocation.MyCommand.Path
 $scriptDir = Split-Path -Parent $scriptPath
 $payloadZip = Join-Path $scriptDir "ArgusCamPayload.zip"
 
 if (-not (Test-Path $payloadZip)) {
-    throw "Cannot find installer payload: $payloadZip"
+    Write-Host "Cannot find installer payload: $payloadZip" -ForegroundColor Red
+    Wait-ForKey
+    exit 1
 }
 
 if (-not (Test-Administrator)) {
@@ -50,6 +63,12 @@ try {
         -ConfigureStaticIp `
         -StaticHostOctet 5
     exit $LASTEXITCODE
+}
+catch {
+    Write-Host ""
+    Write-Host "Installer launcher failed: $($_.Exception.Message)" -ForegroundColor Red
+    Wait-ForKey
+    exit 1
 }
 finally {
     Remove-Item -Path $workDir -Recurse -Force -ErrorAction SilentlyContinue

@@ -2,16 +2,15 @@ param(
     [string]$SiteName = "ArgusCam",
     [string]$AppPoolName = "ArgusCam",
     [string]$InstallRoot = "",
-    [string]$PublicHostName = "app.arguscam.io.vn",
+    [string]$PublicHostName = "",
     [int]$HttpsPort = 443,
     [int]$LocalCallbackPort = 5176,
     [string]$LicenseKey = "",
     [string]$LicenseApiBaseUrl = "https://admin.arguscam.io.vn",
-    [string]$CertificatePfxPath = "",
-    [string]$CertificatePfxPassword = "",
     [switch]$ConfigureStaticIp,
     [int]$StaticHostOctet = 5,
-    [switch]$OpenBrowserAfterInstall = $true
+    [switch]$OpenBrowserAfterInstall = $true,
+    [switch]$NoPauseOnExit
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +20,19 @@ function Write-Step {
     param([string]$Message)
     Write-Host ""
     Write-Host "==> $Message" -ForegroundColor Cyan
+}
+
+function Wait-ForKey {
+    if ($NoPauseOnExit) { return }
+    Write-Host ""
+    Write-Host "Press any key to close this window..." -ForegroundColor Cyan
+    try {
+        $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    }
+    catch {
+        # fallback for non-interactive hosts
+        Read-Host "Press Enter to continue" | Out-Null
+    }
 }
 
 function Assert-Administrator {
@@ -324,25 +336,7 @@ function Get-LicenseApiUrl {
     return "$($BaseUrl.TrimEnd([char]'/'))/$($Path.TrimStart([char]'/'))"
 }
 
-function Invoke-LicenseApiJson {
-    param(
-        [string]$BaseUrl,
-        [string]$Path,
-        [object]$Body
-    )
-
-    $url = Get-LicenseApiUrl -BaseUrl $BaseUrl -Path $Path
-    $jsonBody = $Body | ConvertTo-Json -Depth 10
-
-    return Invoke-RestMethod `
-        -Method Post `
-        -Uri $url `
-        -ContentType "application/json" `
-        -Body $jsonBody `
-        -TimeoutSec 60
-}
-
-function Resolve-LicenseDeployment {
+function Test-ArgusCamLicense {
     param(
         [string]$BaseUrl,
         [string]$Key
@@ -353,12 +347,17 @@ function Resolve-LicenseDeployment {
     }
 
     $normalizedKey = $Key.Trim().ToUpperInvariant()
-
     Write-Step "Checking ArgusCam license"
-    $check = Invoke-LicenseApiJson `
-        -BaseUrl $BaseUrl `
-        -Path "/licenses/check" `
-        -Body @{ license_key = $normalizedKey }
+
+    $url = Get-LicenseApiUrl -BaseUrl $BaseUrl -Path "/licenses/check"
+    $jsonBody = @{ license_key = $normalizedKey } | ConvertTo-Json -Depth 5
+
+    $check = Invoke-RestMethod `
+        -Method Post `
+        -Uri $url `
+        -ContentType "application/json" `
+        -Body $jsonBody `
+        -TimeoutSec 60
 
     if (-not $check.success) {
         throw "License API returned an unsuccessful response."
@@ -368,61 +367,41 @@ function Resolve-LicenseDeployment {
         throw "License is not active. Current status: $($check.result.status). Message: $($check.result.message)"
     }
 
-    Write-Step "Resolving HTTPS certificate from license"
-    $certInfo = Invoke-LicenseApiJson `
-        -BaseUrl $BaseUrl `
-        -Path "/licenses/cert/info" `
-        -Body @{ license_key = $normalizedKey }
-
-    if (-not $certInfo.success -or -not $certInfo.result.available -or [string]::IsNullOrWhiteSpace($certInfo.result.fqdn)) {
-        throw "No active certificate is available for this license yet. Issue or renew the customer certificate in the backoffice, then run the installer again."
-    }
+    Write-Host "License OK ($($check.result.status))." -ForegroundColor Green
 
     return [pscustomobject]@{
-        LicenseKey = $normalizedKey
-        PublicHostName = $certInfo.result.fqdn
-        CertificateVersion = $certInfo.result.version
-        CertificateFingerprint = $certInfo.result.fingerprint_sha256
-        CertificateNotAfter = $certInfo.result.not_after
+        NormalizedKey = $normalizedKey
+        Customer = $check.result.customer
     }
 }
 
-function Save-LicenseCertificatePfx {
+function Register-CloudflareDns {
     param(
         [string]$BaseUrl,
         [string]$Key,
-        [string]$DestinationPath
+        [string]$Ip
     )
 
-    $url = Get-LicenseApiUrl -BaseUrl $BaseUrl -Path "/licenses/cert/download"
-    $jsonBody = @{ license_key = $Key } | ConvertTo-Json -Depth 10
+    Write-Step "Registering Cloudflare DNS for this LAN IP"
 
-    New-Item -ItemType Directory -Path (Split-Path -Parent $DestinationPath) -Force | Out-Null
+    $url = Get-LicenseApiUrl -BaseUrl $BaseUrl -Path "/licenses/register-dns"
+    $jsonBody = @{ license_key = $Key; ip = $Ip } | ConvertTo-Json -Depth 5
 
-    $response = Invoke-WebRequest `
+    $response = Invoke-RestMethod `
         -Method Post `
         -Uri $url `
         -ContentType "application/json" `
         -Body $jsonBody `
-        -OutFile $DestinationPath `
-        -PassThru `
-        -TimeoutSec 180
+        -TimeoutSec 60
 
-    $password = $response.Headers["X-Cert-Password"]
-    if ($password -is [array]) {
-        $password = $password[0]
+    if (-not $response.success) {
+        throw "register-dns API returned an unsuccessful response."
     }
 
-    if ([string]::IsNullOrWhiteSpace($password)) {
-        throw "License certificate download did not include the X-Cert-Password header."
-    }
+    $action = if ($response.result.created) { "created" } else { "updated" }
+    Write-Host "DNS A record ${action}: $($response.result.fqdn) -> $Ip" -ForegroundColor Green
 
-    return [pscustomobject]@{
-        Path = $DestinationPath
-        Password = [string]$password
-        Version = $response.Headers["X-Cert-Version"]
-        Fingerprint = $response.Headers["X-Cert-Fingerprint"]
-    }
+    return [string]$response.result.fqdn
 }
 
 function Update-ArgusCamLicenseSettings {
@@ -465,177 +444,10 @@ function Update-ArgusCamLicenseSettings {
     Write-Host "Saved license settings to $appsettingsPath" -ForegroundColor Green
 }
 
-function Install-CertificateRenewalTask {
-    param(
-        [string]$TaskName,
-        [string]$InstallRootPath,
-        [string]$TargetSiteName,
-        [string]$HostName,
-        [int]$Port,
-        [string]$BaseUrl,
-        [string]$Key,
-        [object]$InitialCertificate
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Key)) {
-        return
-    }
-
-    $scriptPath = Join-Path $InstallRootPath "Update-ArgusCamCertificate.ps1"
-    $statePath = Join-Path $InstallRootPath "cert-renewal-state.json"
-    $pfxPath = Join-Path $InstallRootPath "cert-renewal.pfx"
-
-    $renewScript = @'
-param()
-
-$ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
-
-$LicenseApiBaseUrl = "__LICENSE_API_BASE_URL__"
-$LicenseKey = "__LICENSE_KEY__"
-$SiteName = "__SITE_NAME__"
-$HostName = "__HOST_NAME__"
-$HttpsPort = __HTTPS_PORT__
-$StatePath = "__STATE_PATH__"
-$PfxPath = "__PFX_PATH__"
-
-function Get-LicenseApiUrl {
-    param([string]$BaseUrl, [string]$Path)
-    return "$($BaseUrl.TrimEnd([char]'/'))/$($Path.TrimStart([char]'/'))"
-}
-
-function Invoke-LicenseApiJson {
-    param([string]$Path, [object]$Body)
-    $jsonBody = $Body | ConvertTo-Json -Depth 10
-    return Invoke-RestMethod -Method Post -Uri (Get-LicenseApiUrl -BaseUrl $LicenseApiBaseUrl -Path $Path) -ContentType "application/json" -Body $jsonBody -TimeoutSec 60
-}
-
-function Get-CurrentVersion {
-    if (-not (Test-Path $StatePath)) {
-        return 0
-    }
-
-    try {
-        $state = Get-Content -Path $StatePath -Raw | ConvertFrom-Json
-        if ($null -eq $state.version) {
-            return 0
-        }
-        return [int]$state.version
-    }
-    catch {
-        return 0
-    }
-}
-
-$info = Invoke-LicenseApiJson -Path "/licenses/cert/info" -Body @{ license_key = $LicenseKey }
-if (-not $info.success -or -not $info.result.available) {
-    throw "No active certificate is available for this license."
-}
-
-if ($info.result.fqdn -ne $HostName) {
-    throw "Certificate hostname changed from $HostName to $($info.result.fqdn). Re-run the installer to update IIS bindings and DNS guidance."
-}
-
-$currentVersion = Get-CurrentVersion
-if ([int]$info.result.version -le $currentVersion) {
-    return
-}
-
-$downloadUrl = Get-LicenseApiUrl -BaseUrl $LicenseApiBaseUrl -Path "/licenses/cert/download"
-$downloadBody = @{ license_key = $LicenseKey; current_version = $currentVersion } | ConvertTo-Json -Depth 10
-$response = Invoke-WebRequest -Method Post -Uri $downloadUrl -ContentType "application/json" -Body $downloadBody -OutFile $PfxPath -PassThru -TimeoutSec 180
-
-$password = $response.Headers["X-Cert-Password"]
-if ($password -is [array]) {
-    $password = $password[0]
-}
-
-if ([string]::IsNullOrWhiteSpace($password)) {
-    throw "Certificate download did not include the X-Cert-Password header."
-}
-
-$securePassword = ConvertTo-SecureString ([string]$password) -AsPlainText -Force
-$certificate = Import-PfxCertificate -FilePath $PfxPath -CertStoreLocation "Cert:\LocalMachine\My" -Password $securePassword
-
-Import-Module WebAdministration
-$binding = Get-WebBinding -Name $SiteName -Protocol "https" |
-    Where-Object { $_.bindingInformation -eq "*:${HttpsPort}:$HostName" } |
-    Select-Object -First 1
-
-if ($null -eq $binding) {
-    throw "Could not find HTTPS binding for $SiteName on port $HttpsPort and host $HostName."
-}
-
-$binding.AddSslCertificate($certificate.Thumbprint, "my")
-
-$state = [pscustomobject]@{
-    version = [int]$response.Headers["X-Cert-Version"]
-    fqdn = $response.Headers["X-Cert-Fqdn"]
-    fingerprint = $response.Headers["X-Cert-Fingerprint"]
-    notAfter = $response.Headers["X-Cert-Not-After"]
-    updatedAt = (Get-Date).ToUniversalTime().ToString("o")
-}
-
-$encoding = [System.Text.UTF8Encoding]::new($false)
-[System.IO.File]::WriteAllText($StatePath, ($state | ConvertTo-Json -Depth 10), $encoding)
-Remove-Item -Path $PfxPath -Force -ErrorAction SilentlyContinue
-'@
-
-    $renewScript = $renewScript.Replace("__LICENSE_API_BASE_URL__", $BaseUrl.TrimEnd([char]'/'))
-    $renewScript = $renewScript.Replace("__LICENSE_KEY__", $Key)
-    $renewScript = $renewScript.Replace("__SITE_NAME__", $TargetSiteName)
-    $renewScript = $renewScript.Replace("__HOST_NAME__", $HostName)
-    $renewScript = $renewScript.Replace("__HTTPS_PORT__", [string]$Port)
-    $renewScript = $renewScript.Replace("__STATE_PATH__", $statePath)
-    $renewScript = $renewScript.Replace("__PFX_PATH__", $pfxPath)
-
-    $encoding = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText($scriptPath, $renewScript, $encoding)
-
-    if ($null -ne $InitialCertificate) {
-        $state = [pscustomobject]@{
-            version = [int]$InitialCertificate.CertificateVersion
-            fqdn = $HostName
-            fingerprint = $InitialCertificate.CertificateFingerprint
-            notAfter = $InitialCertificate.CertificateNotAfter
-            updatedAt = (Get-Date).ToUniversalTime().ToString("o")
-        }
-        [System.IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 10), $encoding)
-    }
-
-    $action = New-ScheduledTaskAction `
-        -Execute "powershell.exe" `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
-    $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 3am
-    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew
-
-    Register-ScheduledTask `
-        -TaskName $TaskName `
-        -Action $action `
-        -Trigger $trigger `
-        -Principal $principal `
-        -Settings $settings `
-        -Force | Out-Null
-
-    Write-Host "Registered certificate renewal task: $TaskName" -ForegroundColor Green
-}
-
 function Get-ArgusCamCertificate {
     param(
-        [string]$HostName,
-        [string]$PfxPath,
-        [string]$PfxPassword
+        [string]$HostName
     )
-
-    if (-not [string]::IsNullOrWhiteSpace($PfxPath) -and (Test-Path $PfxPath)) {
-        Write-Host "Importing HTTPS certificate from $PfxPath" -ForegroundColor Green
-        $securePassword = ConvertTo-SecureString $PfxPassword -AsPlainText -Force
-        return Import-PfxCertificate `
-            -FilePath $PfxPath `
-            -CertStoreLocation "Cert:\LocalMachine\My" `
-            -Password $securePassword
-    }
 
     $friendlyName = "ArgusCam IIS $HostName"
     $existingCertificate = Get-ChildItem -Path Cert:\LocalMachine\My |
@@ -649,11 +461,12 @@ function Get-ArgusCamCertificate {
         Select-Object -First 1
 
     if ($null -ne $existingCertificate) {
+        Write-Host "Reusing existing self-signed certificate for $HostName (valid until $($existingCertificate.NotAfter))." -ForegroundColor Green
         return $existingCertificate
     }
 
-    Write-Host "No trusted PFX certificate found. Creating a self-signed fallback certificate for $HostName." -ForegroundColor Yellow
-    Write-Host "Browsers will warn unless clients trust this certificate." -ForegroundColor Yellow
+    Write-Host "Creating self-signed certificate for $HostName." -ForegroundColor Yellow
+    Write-Host "Browsers will warn the first time you visit; tap 'Proceed' / 'Accept the risk' once and the warning will not show again on that device." -ForegroundColor Yellow
 
     $certificate = New-SelfSignedCertificate `
         -DnsName $HostName `
@@ -727,146 +540,141 @@ function Ensure-FirewallRule {
         -LocalPort $Port | Out-Null
 }
 
-Assert-Administrator
+try {
+    Assert-Administrator
 
-if ($ConfigureStaticIp) {
-    Write-Step "Configuring static LAN IP"
-    $lanIp = Set-StaticLanIpIfNeeded -HostOctet $StaticHostOctet
-}
-else {
-    $lanIp = (Get-PrimaryLanConfiguration).IPv4Address
-}
+    if ([string]::IsNullOrWhiteSpace($LicenseKey)) {
+        throw "License key is required (-LicenseKey)."
+    }
 
-$bundleRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$sourceSitePath = Join-Path $bundleRoot "site"
+    $licenseInfo = Test-ArgusCamLicense -BaseUrl $LicenseApiBaseUrl -Key $LicenseKey
+    $LicenseKey = $licenseInfo.NormalizedKey
 
-if (-not (Test-Path $sourceSitePath)) {
-    throw "Cannot find the site payload at $sourceSitePath"
-}
+    if ($ConfigureStaticIp) {
+        Write-Step "Configuring static LAN IP"
+        $lanIp = Set-StaticLanIpIfNeeded -HostOctet $StaticHostOctet
+    }
+    else {
+        $lanIp = (Get-PrimaryLanConfiguration).IPv4Address
+        Write-Host "Using current LAN IP: $lanIp" -ForegroundColor Green
+    }
 
-$licenseDeployment = Resolve-LicenseDeployment `
-    -BaseUrl $LicenseApiBaseUrl `
-    -Key $LicenseKey
-
-if ($null -ne $licenseDeployment) {
-    $LicenseKey = $licenseDeployment.LicenseKey
-    $PublicHostName = $licenseDeployment.PublicHostName
-    $downloadedPfxPath = Join-Path ([System.IO.Path]::GetTempPath()) ("ArgusCamCert_" + [guid]::NewGuid().ToString("N") + ".pfx")
-    $downloadedPfx = Save-LicenseCertificatePfx `
+    $resolvedFqdn = Register-CloudflareDns `
         -BaseUrl $LicenseApiBaseUrl `
-        -Key $licenseDeployment.LicenseKey `
-        -DestinationPath $downloadedPfxPath
+        -Key $LicenseKey `
+        -Ip $lanIp
 
-    $CertificatePfxPath = $downloadedPfx.Path
-    $CertificatePfxPassword = $downloadedPfx.Password
-
-    Write-Host "License certificate: $PublicHostName v$($licenseDeployment.CertificateVersion), expires $($licenseDeployment.CertificateNotAfter)" -ForegroundColor Green
-}
-
-if ([string]::IsNullOrWhiteSpace($CertificatePfxPath)) {
-    $defaultCertificatePath = Join-Path $bundleRoot "certs\$PublicHostName.pfx"
-    if (Test-Path $defaultCertificatePath) {
-        $CertificatePfxPath = $defaultCertificatePath
+    if (-not [string]::IsNullOrWhiteSpace($PublicHostName) -and $PublicHostName -ne $resolvedFqdn) {
+        Write-Host "Ignoring -PublicHostName '$PublicHostName'; license DNS resolved to '$resolvedFqdn'." -ForegroundColor Yellow
     }
-}
+    $PublicHostName = $resolvedFqdn
 
-if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
-    $InstallRoot = Join-Path $env:ProgramFiles "ArgusCam"
-}
+    $bundleRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+    $sourceSitePath = Join-Path $bundleRoot "site"
 
-$targetSitePath = Join-Path $InstallRoot "site"
-$preserveRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ArgusCamPreserve_" + [guid]::NewGuid().ToString("N"))
-$preservedDatabase = $false
+    if (-not (Test-Path $sourceSitePath)) {
+        throw "Cannot find the site payload at $sourceSitePath"
+    }
 
-Write-Step "Enabling IIS"
-Enable-IisFeatures
+    if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
+        $InstallRoot = Join-Path $env:ProgramFiles "ArgusCam"
+    }
 
-Write-Step "Checking ASP.NET Core IIS module"
-if (-not (Assert-AspNetCoreModule)) {
-    Write-Step "Installing ASP.NET Core Hosting Bundle"
-    Install-AspNetCoreHostingBundle -BundleRootPath $bundleRoot
+    $targetSitePath = Join-Path $InstallRoot "site"
+    $preserveRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ArgusCamPreserve_" + [guid]::NewGuid().ToString("N"))
+    $preservedDatabase = $false
 
+    Write-Step "Enabling IIS"
+    Enable-IisFeatures
+
+    Write-Step "Checking ASP.NET Core IIS module"
     if (-not (Assert-AspNetCoreModule)) {
-        throw "AspNetCoreModuleV2 is still missing after installing the hosting bundle."
+        Write-Step "Installing ASP.NET Core Hosting Bundle"
+        Install-AspNetCoreHostingBundle -BundleRootPath $bundleRoot
+
+        if (-not (Assert-AspNetCoreModule)) {
+            throw "AspNetCoreModuleV2 is still missing after installing the hosting bundle."
+        }
+    }
+
+    Write-Step "Removing old IIS site if it exists"
+    Remove-ExistingSite -ExistingSiteName $SiteName -ExistingAppPoolName $AppPoolName
+
+    Write-Step "Preserving existing SQLite database if present"
+    $preservedDatabase = Copy-ExistingSqliteDatabases -ExistingInstallRoot $InstallRoot -BackupRoot $preserveRoot
+
+    Write-Step "Replacing old install files"
+    if (Test-Path $InstallRoot) {
+        try {
+            Remove-Item -Path $InstallRoot -Recurse -Force
+        }
+        catch {
+            throw "Could not replace files in $InstallRoot. Close any explorer window opened in that folder, then run the installer again. Details: $($_.Exception.Message)"
+        }
+    }
+
+    New-Item -ItemType Directory -Path $targetSitePath -Force | Out-Null
+    Invoke-Robocopy -Source $sourceSitePath -Destination $targetSitePath
+    if ($preservedDatabase) {
+        Restore-SqliteDatabases -BackupRoot $preserveRoot -TargetSitePath $targetSitePath
+    }
+    Remove-Item -Path $preserveRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+    Update-ArgusCamLicenseSettings `
+        -TargetSitePath $targetSitePath `
+        -Key $LicenseKey `
+        -BaseUrl $LicenseApiBaseUrl
+
+    $url = if ($HttpsPort -eq 443) { "https://$PublicHostName" } else { "https://${PublicHostName}:$HttpsPort" }
+    $localSiteUrl = "http://localhost:$LocalCallbackPort"
+    $localCallbackUrl = "http://localhost:$LocalCallbackPort/api/google-drive/callback"
+
+    Write-Step "Creating IIS app pool and site"
+    $certificate = Get-ArgusCamCertificate -HostName $PublicHostName
+    New-ArgusCamSite `
+        -TargetSiteName $SiteName `
+        -TargetAppPoolName $AppPoolName `
+        -PhysicalPath $targetSitePath `
+        -HttpsPort $HttpsPort `
+        -LocalCallbackPort $LocalCallbackPort `
+        -PublicHostName $PublicHostName `
+        -CertificateThumbprint $certificate.Thumbprint
+
+    Write-Step "Opening Windows Firewall port"
+    Ensure-FirewallRule -Port $HttpsPort
+
+    Write-Step "Granting write permissions"
+    Grant-AppPermissions -TargetPath $InstallRoot -TargetAppPool $AppPoolName
+
+    Start-Website -Name $SiteName
+
+    Write-Host ""
+    Write-Host "ArgusCam IIS deployment completed." -ForegroundColor Green
+    Write-Host "Install root : $InstallRoot" -ForegroundColor Green
+    Write-Host "Server LAN IP: $lanIp" -ForegroundColor Green
+    Write-Host "Public host  : $PublicHostName" -ForegroundColor Green
+    Write-Host "Site URL     : $url" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "Cloudflare DNS A record was created/updated automatically (DNS only / grey cloud)." -ForegroundColor Yellow
+    Write-Host "LAN devices using public DNS (1.1.1.1, 8.8.8.8) will resolve $PublicHostName to $lanIp." -ForegroundColor Yellow
+    Write-Host "First visit shows a self-signed warning; tap 'Accept the risk' once - the device remembers it." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Local site URL          : $localSiteUrl" -ForegroundColor Green
+    Write-Host "Local Google callback   : $localCallbackUrl" -ForegroundColor Green
+
+    if ($OpenBrowserAfterInstall) {
+        Start-Process $url
     }
 }
-
-Write-Step "Removing old IIS site if it exists"
-Remove-ExistingSite -ExistingSiteName $SiteName -ExistingAppPoolName $AppPoolName
-
-Write-Step "Preserving existing SQLite database if present"
-$preservedDatabase = Copy-ExistingSqliteDatabases -ExistingInstallRoot $InstallRoot -BackupRoot $preserveRoot
-
-Write-Step "Replacing old install files"
-if (Test-Path $InstallRoot) {
-    try {
-        Remove-Item -Path $InstallRoot -Recurse -Force
+catch {
+    Write-Host ""
+    Write-Host "==> Install FAILED" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    if ($_.ScriptStackTrace) {
+        Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
     }
-    catch {
-        throw "Could not replace files in $InstallRoot. Close any explorer window opened in that folder, then run the installer again. Details: $($_.Exception.Message)"
-    }
+    Wait-ForKey
+    exit 1
 }
 
-New-Item -ItemType Directory -Path $targetSitePath -Force | Out-Null
-Invoke-Robocopy -Source $sourceSitePath -Destination $targetSitePath
-if ($preservedDatabase) {
-    Restore-SqliteDatabases -BackupRoot $preserveRoot -TargetSitePath $targetSitePath
-}
-Remove-Item -Path $preserveRoot -Recurse -Force -ErrorAction SilentlyContinue
-
-Update-ArgusCamLicenseSettings `
-    -TargetSitePath $targetSitePath `
-    -Key $LicenseKey `
-    -BaseUrl $LicenseApiBaseUrl
-
-$url = if ($HttpsPort -eq 443) { "https://$PublicHostName" } else { "https://${PublicHostName}:$HttpsPort" }
-$localSiteUrl = "http://localhost:$LocalCallbackPort"
-$localCallbackUrl = "http://localhost:$LocalCallbackPort/api/google-drive/callback"
-
-Write-Step "Creating IIS app pool and site"
-$certificate = Get-ArgusCamCertificate `
-    -HostName $PublicHostName `
-    -PfxPath $CertificatePfxPath `
-    -PfxPassword $CertificatePfxPassword
-New-ArgusCamSite `
-    -TargetSiteName $SiteName `
-    -TargetAppPoolName $AppPoolName `
-    -PhysicalPath $targetSitePath `
-    -HttpsPort $HttpsPort `
-    -LocalCallbackPort $LocalCallbackPort `
-    -PublicHostName $PublicHostName `
-    -CertificateThumbprint $certificate.Thumbprint
-
-if ($null -ne $licenseDeployment -and (Test-Path $CertificatePfxPath)) {
-    Remove-Item -Path $CertificatePfxPath -Force -ErrorAction SilentlyContinue
-}
-
-Install-CertificateRenewalTask `
-    -TaskName "$SiteName Certificate Renewal" `
-    -InstallRootPath $InstallRoot `
-    -TargetSiteName $SiteName `
-    -HostName $PublicHostName `
-    -Port $HttpsPort `
-    -BaseUrl $LicenseApiBaseUrl `
-    -Key $LicenseKey `
-    -InitialCertificate $licenseDeployment
-
-Write-Step "Opening Windows Firewall port"
-Ensure-FirewallRule -Port $HttpsPort
-
-Write-Step "Granting write permissions"
-Grant-AppPermissions -TargetPath $InstallRoot -TargetAppPool $AppPoolName
-
-Start-Website -Name $SiteName
-
-Write-Host ""
-Write-Host "ArgusCam IIS deployment completed." -ForegroundColor Green
-Write-Host "Install root: $InstallRoot" -ForegroundColor Green
-Write-Host "LAN site URL: $url" -ForegroundColor Green
-Write-Host "Router DNS mapping: $PublicHostName -> $lanIp" -ForegroundColor Green
-Write-Host "Local site URL: $localSiteUrl" -ForegroundColor Green
-Write-Host "Local Google callback URL: $localCallbackUrl" -ForegroundColor Green
-
-if ($OpenBrowserAfterInstall) {
-    Start-Process $url
-}
+Wait-ForKey

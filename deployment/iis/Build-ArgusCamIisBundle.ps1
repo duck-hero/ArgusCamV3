@@ -68,7 +68,7 @@ function Ensure-HostingBundlePrereq {
     Write-Host "Official source: $($downloadInfo.SourcePage) (verified $($downloadInfo.VerifiedOn))" -ForegroundColor Yellow
 
     try {
-        Invoke-WebRequest -Uri $downloadInfo.DownloadUrl -OutFile $targetFile
+        Invoke-WebRequest -Uri $downloadInfo.DownloadUrl -OutFile $targetFile -UseBasicParsing
     }
     catch {
         Write-Host "Auto-download failed. You can place the hosting bundle manually into $TargetPrereqRoot." -ForegroundColor Yellow
@@ -85,10 +85,8 @@ $apiProject = Join-Path $repoRoot "src/ArgusCam.Api/ArgusCam.Api.csproj"
 $bundleRoot = Join-Path $repoRoot "artifacts/iis-bundle"
 $siteRoot = Join-Path $bundleRoot "site"
 $prereqRoot = Join-Path $bundleRoot "prereqs"
-$certRoot = Join-Path $bundleRoot "certs"
 $publishTemp = Join-Path $bundleRoot "_publish-api"
 ${sourcePrereqRoot} = Join-Path $scriptRoot "prereqs"
-$sourceCertRoot = Join-Path $scriptRoot "certs"
 
 Write-Step "Cleaning old bundle"
 if (Test-Path $bundleRoot) {
@@ -137,14 +135,6 @@ else {
 }
 
 Ensure-HostingBundlePrereq -TargetPrereqRoot $prereqRoot
-
-Write-Step "Copying HTTPS certificates"
-if (Test-Path $sourceCertRoot) {
-    Invoke-Robocopy -Source $sourceCertRoot -Destination $certRoot
-}
-else {
-    Write-Host "No local certs folder found at $sourceCertRoot. Installer will use an existing certificate or self-signed fallback." -ForegroundColor Yellow
-}
 
 Copy-Item (Join-Path $scriptRoot "Install-ArgusCamIis.ps1") (Join-Path $bundleRoot "Install-ArgusCamIis.ps1") -Force
 Copy-Item (Join-Path $scriptRoot "README.md") (Join-Path $bundleRoot "README.md") -Force
